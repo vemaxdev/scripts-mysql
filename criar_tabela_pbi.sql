@@ -1,0 +1,22 @@
+CREATE TABLE pbi.indicadores_poack (
+  ID int NOT NULL AUTO_INCREMENT,
+  dt_registro date NOT NULL DEFAULT (CURRENT_DATE),
+  ref_mes CHAR(7) GENERATED ALWAYS AS (DATE_FORMAT(dt_registro, '%Y-%m')) STORED,
+  ordens_ra int DEFAULT NULL,
+  vencidos_ab int DEFAULT NULL,
+  vencidos_at int DEFAULT NULL,
+  entrega_maior_promessa_ab int DEFAULT NULL,
+  entrega_maior_promessa_at int DEFAULT NULL,
+  simulada_maior_entrega_ab int DEFAULT NULL,
+  simulada_maior_entrega_at int DEFAULT NULL,
+  ciclo_zerado int DEFAULT NULL,
+  oc_maior_180_dias int DEFAULT NULL,
+  kanban_sem_of int DEFAULT NULL,
+  priorizacoes decimal(9,4) DEFAULT NULL,
+  oc_remessa_passado decimal(9,4) DEFAULT NULL,
+  OTD decimal(9,4) DEFAULT NULL,
+  ciclo decimal(9,4) DEFAULT NULL,
+  total_multas decimal(15,2) DEFAULT NULL,
+  PRIMARY KEY (ID),
+  UNIQUE KEY uq_indicadores_poack_ref_mes (ref_mes)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
