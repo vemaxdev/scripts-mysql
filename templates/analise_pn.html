@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Historia do PN</title>
+<style>
+  :root {
+    --verde: #1e8e3e;
+    --verde-bg: #e6f4ea;
+    --azul: #1a73e8;
+    --azul-bg: #e8f0fe;
+    --laranja: #b06000;
+    --laranja-bg: #fef3e0;
+    --vermelho: #c5221f;
+    --vermelho-bg: #fce8e6;
+    --cinza: #5f6368;
+    --cinza-bg: #f1f3f4;
+    --texto: #202124;
+    --borda: #dadce0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    background: #f8f9fa;
+    color: var(--texto);
+    margin: 0;
+    padding: 32px 16px 64px;
+  }
+  .container { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitulo { color: var(--cinza); margin-top: 0; margin-bottom: 24px; font-size: 0.95rem; }
+
+  form.busca {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 32px;
+  }
+  form.busca input[type=text] {
+    flex: 1;
+    padding: 12px 14px;
+    font-size: 1rem;
+    border: 1px solid var(--borda);
+    border-radius: 8px;
+  }
+  form.busca button {
+    padding: 12px 20px;
+    font-size: 1rem;
+    background: var(--azul);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  form.busca button:hover { background: #1558b0; }
+
+  .fonte-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: -16px 0 32px;
+    font-size: 0.85rem;
+  }
+  .fonte-toggle-label { color: var(--cinza); }
+  .fonte-opcao {
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--borda);
+    color: var(--cinza);
+    text-decoration: none;
+    font-weight: 600;
+  }
+  .fonte-opcao:hover { border-color: var(--azul); color: var(--azul); }
+  .fonte-opcao.ativa {
+    background: var(--azul);
+    border-color: var(--azul);
+    color: white;
+  }
+
+  .erro {
+    background: var(--vermelho-bg);
+    color: var(--vermelho);
+    padding: 12px 16px;
+    border-radius: 8px;
+    margin-bottom: 24px;
+  }
+
+  .card {
+    background: white;
+    border: 1px solid var(--borda);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-bottom: 24px;
+  }
+
+  .resumo-topo {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .resumo-topo h2 { margin: 0 0 4px; font-size: 1.3rem; }
+  .badge {
+    display: inline-block;
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    white-space: nowrap;
+  }
+  .badge.verde { background: var(--verde-bg); color: var(--verde); }
+  .badge.azul { background: var(--azul-bg); color: var(--azul); }
+  .badge.laranja { background: var(--laranja-bg); color: var(--laranja); }
+  .badge.vermelho { background: var(--vermelho-bg); color: var(--vermelho); }
+  .badge.cinza { background: var(--cinza-bg); color: var(--cinza); }
+
+  .status-desc { color: var(--cinza); font-size: 0.9rem; margin-top: 8px; }
+
+  .divergente-alerta {
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: var(--laranja-bg);
+    color: var(--laranja);
+    border-radius: 8px;
+    font-size: 0.88rem;
+  }
+
+  .barra-progresso-wrap { margin-top: 20px; }
+  .barra-progresso-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.85rem;
+    color: var(--cinza);
+    margin-bottom: 6px;
+  }
+  .barra-progresso-bg {
+    background: var(--cinza-bg);
+    border-radius: 999px;
+    height: 12px;
+    overflow: hidden;
+  }
+  .barra-progresso-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: var(--verde);
+    transition: width 0.3s ease;
+  }
+  .barra-progresso-fill.incompleta { background: var(--azul); }
+
+  .destino {
+    margin-top: 18px;
+    padding: 14px 16px;
+    border-radius: 8px;
+    background: var(--cinza-bg);
+    font-size: 0.95rem;
+  }
+  .destino strong { color: var(--texto); }
+
+  h3.titulo-secao {
+    font-size: 1.05rem;
+    margin: 32px 0 16px;
+  }
+
+  .timeline { position: relative; padding-left: 28px; }
+  .timeline::before {
+    content: "";
+    position: absolute;
+    left: 9px;
+    top: 6px;
+    bottom: 6px;
+    width: 2px;
+    background: var(--borda);
+  }
+  .evento {
+    position: relative;
+    padding: 0 0 22px 20px;
+  }
+  .evento:last-child { padding-bottom: 0; }
+  .evento::before {
+    content: "";
+    position: absolute;
+    left: -28px;
+    top: 4px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: white;
+    border: 3px solid var(--cinza);
+  }
+  .evento.real::before { border-color: var(--verde); }
+  .evento.projetado::before { border-color: var(--azul); border-style: dashed; }
+  .evento.cobriu::before { background: var(--verde); border-color: var(--verde); }
+  .evento.cobriu.projetado::before { background: var(--azul); border-color: var(--azul); }
+
+  .evento-card {
+    background: white;
+    border: 1px solid var(--borda);
+    border-radius: 8px;
+    padding: 12px 16px;
+  }
+  .evento.cobriu .evento-card { border-color: var(--verde); background: var(--verde-bg); }
+  .evento.projetado.cobriu .evento-card { border-color: var(--azul); background: var(--azul-bg); }
+  .evento-linha1 {
+    display: flex;
+    justify-content: space-between;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .evento-tag {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--cinza-bg);
+    color: var(--cinza);
+  }
+  .evento.real .evento-tag { background: var(--verde-bg); color: var(--verde); }
+  .evento.projetado .evento-tag { background: var(--azul-bg); color: var(--azul); }
+  .evento-detalhe {
+    color: var(--cinza);
+    font-size: 0.85rem;
+    margin-top: 4px;
+  }
+  .evento-marco {
+    margin-top: 6px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--verde);
+  }
+  .evento.projetado .evento-marco { color: var(--azul); }
+
+  .vazio {
+    color: var(--cinza);
+    font-size: 0.9rem;
+    font-style: italic;
+    padding: 8px 0;
+  }
+
+  .sem-data-lista {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .sem-data-lista li {
+    background: var(--cinza-bg);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 0.9rem;
+    display: flex;
+    justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Historia de cobertura de um PN</h1>
+  <p class="subtitulo">Veja por quais notas e ordens de fabricacao um pn passou ate ser (ou nao) coberto.</p>
+
+  <form class="busca" method="get" action="/">
+    <input type="text" name="pn" placeholder="Digite o pn (ex: 123456-01)" value="{{ pn }}" autofocus>
+    <input type="hidden" name="fonte" value="{{ fonte }}">
+    <button type="submit">Buscar</button>
+  </form>
+
+  <div class="fonte-toggle">
+    <span class="fonte-toggle-label">Fonte da projeção:</span>
+    <a href="/?pn={{ pn|urlencode }}&fonte=auto" class="fonte-opcao {% if fonte == 'auto' %}ativa{% endif %}">Previsão de faturamento</a>
+    <a href="/?pn={{ pn|urlencode }}&fonte=simulado" class="fonte-opcao {% if fonte == 'simulado' %}ativa{% endif %}">Simulação de manufatura (de_simul)</a>
+  </div>
+
+  {% if erro %}
+    <div class="erro">{{ erro }}</div>
+  {% endif %}
+
+  {% if resultado %}
+    {% set r = resultado %}
+    <div class="card">
+      <div class="resumo-topo">
+        <div>
+          <h2>{{ r.pn }}</h2>
+          <div class="status-desc">Saldo a cobrir: <strong>{{ "%.0f"|format(r.qtde_saldo) }}</strong> &nbsp;·&nbsp; Status no sistema: <strong>{{ r.stts_sistema }}</strong></div>
+        </div>
+        <span class="badge {{ r.status_info.cor }}">{{ r.status_info.label }}</span>
+      </div>
+      <div class="status-desc">{{ r.status_info.desc }}</div>
+
+      {% if r.comparativo == "DIVERGENTE" %}
+        <div class="divergente-alerta">
+          ⚠ A nossa analise (baseada nas notas e OFs reais) diverge do status registrado no sistema ({{ r.stts_sistema }}).
+        </div>
+      {% endif %}
+
+      <div class="barra-progresso-wrap">
+        <div class="barra-progresso-labels">
+          <span>Quantidade acumulada</span>
+          <span>{{ "%.0f"|format(r.acumulado_final) }} / {{ "%.0f"|format(r.qtde_saldo) }} ({{ r.percentual }}%)</span>
+        </div>
+        <div class="barra-progresso-bg">
+          <div class="barra-progresso-fill {% if r.percentual < 100 %}incompleta{% endif %}" style="width: {{ r.percentual }}%;"></div>
+        </div>
+      </div>
+
+      {% if r.data_cobertura %}
+        <div class="destino">
+          {% if r.status_analise == "COBERTO" %}
+            ✅ Coberto em <strong>{{ r.data_cobertura.strftime("%d/%m/%Y") }}</strong> pela OF <strong>{{ r.of_cobertura }}</strong>.
+          {% else %}
+            🔵 Previsao de cobertura em <strong>{{ r.data_cobertura.strftime("%d/%m/%Y") }}</strong> pela OF <strong>{{ r.of_cobertura }}</strong> (ainda nao aconteceu) — data {{ "simulada pela manufatura" if r.fonte == "simulado" else "de previsão de faturamento" }}.
+          {% endif %}
+        </div>
+      {% elif r.status_analise == "COBERTO" %}
+        <div class="destino">✅ O sistema indica que esse pn ja esta coberto, mas nao encontramos a nota real correspondente na SD2.</div>
+      {% else %}
+        <div class="destino">❓ Ainda nao ha uma data prevista para a cobertura completa desse pn.</div>
+      {% endif %}
+    </div>
+
+    <h3 class="titulo-secao">Linha do tempo</h3>
+    <div class="card">
+      {% if r.linha_do_tempo %}
+        <div class="timeline">
+          {% for ev in r.linha_do_tempo %}
+            <div class="evento {{ ev.tipo }} {% if ev.cobriu %}cobriu{% endif %}">
+              <div class="evento-card">
+                <div class="evento-linha1">
+                  <span>OF {{ ev.of }}</span>
+                  <span class="evento-tag">{{ "Nota real" if ev.tipo == "real" else ("Simulação manufatura" if r.fonte == "simulado" else "Previsão faturamento") }}</span>
+                </div>
+                <div class="evento-detalhe">
+                  {{ ev.data.strftime("%d/%m/%Y") if ev.data else "sem data" }}
+                  &nbsp;·&nbsp; quantidade {{ "%.0f"|format(ev.qtde) }}
+                  &nbsp;·&nbsp; acumulado {{ "%.0f"|format(ev.acumulado) }} / {{ "%.0f"|format(r.qtde_saldo) }}
+                </div>
+                {% if ev.cobriu %}
+                  <div class="evento-marco">
+                    {{ "✅ Saldo coberto aqui" if ev.tipo == "real" else "🔵 Saldo sera coberto aqui (projecao)" }}
+                  </div>
+                {% endif %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="vazio">Nenhuma nota real ou OF com data foi encontrada para esse pn.</div>
+      {% endif %}
+    </div>
+
+    {% if r.ofs_sem_data %}
+      <h3 class="titulo-secao">OFs pendentes sem data prevista</h3>
+      <div class="card">
+        <p class="status-desc" style="margin-top:0;">Essas OFs ainda vao ser necessarias para fechar o saldo, mas ainda nao tem previsao de faturamento nem simulacao de manufatura.</p>
+        <ul class="sem-data-lista">
+          {% for ev in r.ofs_sem_data %}
+            <li><span>OF {{ ev.of }}</span><span>quantidade {{ "%.0f"|format(ev.qtde) }}</span></li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+  {% endif %}
+</div>
+</body>
+</html>
