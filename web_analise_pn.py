@@ -1,11 +1,13 @@
 """
 Dashboard web para analisar um pn, mostrando de forma visual a "historia"
-dele: quais notas reais (SD2) e quais OFs projetadas foram somadas ate
-chegar (ou nao) na data de cobertura.
+dele: a caminhada de OFs em manufatura.pn_extrato_cobertura ate chegar (ou
+nao) na cobertura do saldo.
 
 Reaproveita a mesma logica/consultas de cobertura.py e analise_pn.py, mas
-em vez de devolver so o resultado final, mantem o detalhe de cada evento
-(nota ou OF) para montar a linha do tempo.
+em vez de devolver so o resultado final, mantem cada linha do extrato como
+um evento da timeline (enriquecida com a data real via SD2 quando a
+categoria e ROMANEIO/NF, ou com objeto_dezena_atual.de_simul quando ainda
+esta pendente).
 
 Uso:
     py -m pip install flask   (se ainda nao instalado)
@@ -15,12 +17,35 @@ Uso:
 
 import pandas as pd
 from flask import Flask, render_template, request
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from analise_pn import passo1_pn
-from cobertura import engine, passo2_emissao_sd2
+from cobertura import engine
 
 app = Flask(__name__)
+
+REAIS = ("ROMANEIO", "NF")
+
+CATEGORIA_LABEL = {
+    "ROMANEIO": "Nota real (romaneio)",
+    "NF": "Nota real (NF)",
+    "DESCOBERTO_MANUFATURA": "Projeção (manufatura)",
+    "DESCOBERTO": "Sem OF definida",
+    "IGNORADA": "Ignorada",
+    "EDI": "EDI",
+}
+
+STATUS_INFO = {
+    "COBERTO": {"cor": "verde", "label": "Coberto", "desc": "O saldo desse pn ja foi totalmente atendido."},
+    "DESCOBERTO_MANUFATURA": {
+        "cor": "azul",
+        "label": "Cobertura projetada (manufatura)",
+        "desc": "Ha uma OF em manufatura que deve fechar o saldo (data simulada via objeto_dezena_atual), mas ainda nao foi romaneada/faturada.",
+    },
+    "DESCOBERTO": {"cor": "vermelho", "label": "Descoberto", "desc": "Nao ha OF que garanta quando esse pn sera atendido."},
+    "IGNORADA": {"cor": "cinza", "label": "Ignorada", "desc": "A ultima OF do extrato de cobertura foi marcada como ignorada."},
+    "EDI": {"cor": "azul", "label": "Cobertura via EDI", "desc": "A cobertura desse pn depende de um EDI ainda nao confirmado como nota real."},
+}
 
 
 def _to_date(value):
@@ -30,146 +55,91 @@ def _to_date(value):
     return pd.to_datetime(value).date()
 
 
-def montar_historico_real(pn: str, qtde_saldo: float, df_notas: pd.DataFrame):
-    """Reproduz o passo 3 (acumulo de notas reais da SD2), mas devolvendo
-    cada nota como um evento da linha do tempo, nao so o resumo final."""
-    notas = (
-        df_notas.dropna(subset=["emissao"])
-        .astype({"quantidade": "float64"})
-        .groupby(["of", "emissao"], as_index=False)["quantidade"]
-        .max()
-        .sort_values(["emissao", "of"])
-    )
-
-    eventos = []
-    acumulado = 0.0
-    cobriu_em = None
-    for _, row in notas.iterrows():
-        acumulado += row["quantidade"]
-        cruzou = cobriu_em is None and acumulado >= qtde_saldo
-        eventos.append({
-            "tipo": "real",
-            "of": row["of"],
-            "data": _to_date(row["emissao"]),
-            "qtde": row["quantidade"],
-            "acumulado": acumulado,
-            "cobriu": cruzou,
-        })
-        if cruzou:
-            cobriu_em = eventos[-1]
-
-    return eventos, acumulado, cobriu_em
+def _historico_extrato(pn: str) -> pd.DataFrame:
+    """Todas as linhas de pn_extrato_cobertura desse pn, em ordem de id: a
+    caminhada de OFs que o processo de extrato fez ate o saldo bater (ou a
+    ultima tentativa conhecida, quando nem somando tudo cobre)."""
+    stmt = text("""
+        SELECT id, ordem_fabricacao AS `of`, categoria, saldo_final_pn, qtd_of
+        FROM pn_extrato_cobertura
+        WHERE pn = :pn
+        ORDER BY id
+    """)
+    return pd.read_sql(stmt, engine, params={"pn": pn})
 
 
-def montar_projecao(pn: str, qtde_saldo: float, leftover: float, ofs_usadas: set, fonte: str = "auto"):
-    """Reproduz o passo 4 (projecao via previsao de faturamento e/ou
-    manufatura), devolvendo cada OF candidata como evento, mais a
-    classificacao final (COB / COMOF / STKSEMOF / SEMOF).
-
-    fonte:
-      - "auto": previsao de faturamento (PFAT); se nula/vencida, cai no
-        de_simul da manufatura (comportamento padrao, igual ao cobertura.py).
-      - "simulado": ignora a previsao de faturamento e usa so o de_simul de
-        objeto_dezena_atual (manufatura).
-    """
-    if fonte == "simulado":
-        stmt = text("""
+def _datas_sd2(ofs: list) -> pd.DataFrame:
+    """Data real (SD2) das OFs informadas, mesmo filtro de sempre: oc_linha
+    via ordem_fabricacao, cliente Embraer IN (6,7,8), dentro do periodo CFG."""
+    if not ofs:
+        return pd.DataFrame(columns=["of", "data_cobertura"])
+    stmt = text("""
+        WITH cfg_islands AS (
+            SELECT data_periodo_final, MIN(id) AS min_id, MAX(id) AS max_id, COUNT(*) AS cnt
+            FROM (
+                SELECT id, data_periodo_final,
+                       ROW_NUMBER() OVER (ORDER BY id)
+                       - ROW_NUMBER() OVER (PARTITION BY data_periodo_final ORDER BY id) AS grp
+                FROM manufatura.controle_processamento_cobertura
+            ) t
+            GROUP BY data_periodo_final, grp
+        ),
+        cfg_atual AS (
+            SELECT data_periodo_inicial, data_periodo_final
+            FROM manufatura.controle_processamento_cobertura
+            ORDER BY id DESC
+            LIMIT 1
+        ),
+        cfg_ilha_atual AS (
+            SELECT min_id, max_id FROM cfg_islands ORDER BY max_id DESC LIMIT 1
+        ),
+        cfg_anterior AS (
+            SELECT i.data_periodo_final
+            FROM cfg_islands i
+            JOIN cfg_ilha_atual c ON i.max_id < c.min_id
+            WHERE i.cnt >= 10
+            ORDER BY i.max_id DESC
+            LIMIT 1
+        ),
+        CFG AS (
             SELECT
-                ODF.`of`,
-                ODF.qtde,
-                MAX(OBJD.de_simul) AS objd_de_simul
-            FROM ordem_fabricacao ODF
-            JOIN objeto_dezena_atual OBJD ON OBJD.`of` = ODF.`of`
-            WHERE ODF.pn = :pn
-            GROUP BY ODF.`of`, ODF.qtde
-        """)
-        ofs = pd.read_sql(stmt, engine, params={"pn": pn})
-    else:
-        stmt = text("""
-            SELECT
-                ODF.`of`,
-                ODF.qtde,
-                MAX(PFAT.`Emissão`) AS pfat_emissao,
-                MAX(OBJD.de_simul) AS objd_de_simul
-            FROM ordem_fabricacao ODF
-            LEFT JOIN pbi.vwf_previsao_faturamento PFAT ON PFAT.`Nro Doc` = ODF.`of`
-            LEFT JOIN objeto_dezena_atual OBJD ON OBJD.`of` = ODF.`of`
-            WHERE ODF.pn = :pn
-              AND (PFAT.`Nro Doc` IS NOT NULL OR OBJD.`of` IS NOT NULL)
-            GROUP BY ODF.`of`, ODF.qtde
-        """)
-        ofs = pd.read_sql(stmt, engine, params={"pn": pn})
-
-    if ofs.empty:
-        return [], [], leftover, "SEMOF" if leftover < qtde_saldo else "COB"
-
-    ofs["qtde"] = ofs["qtde"].fillna(0)
-
-    hoje = pd.Timestamp.now().normalize()
-    objd_de_simul = pd.to_datetime(ofs["objd_de_simul"], errors="coerce")
-    objd_de_simul = objd_de_simul.where(objd_de_simul >= hoje)
-
-    if fonte == "simulado":
-        ofs["data_projecao"] = objd_de_simul
-    else:
-        pfat_emissao = pd.to_datetime(ofs["pfat_emissao"], errors="coerce")
-        pfat_emissao = pfat_emissao.where(pfat_emissao >= hoje)
-        ofs["data_projecao"] = pfat_emissao.combine_first(objd_de_simul)
-
-    ofs = ofs[~ofs["of"].isin(ofs_usadas)]
-
-    dated = ofs[ofs["data_projecao"].notna()].sort_values("data_projecao")
-    undated = ofs[ofs["data_projecao"].isna()]
-
-    eventos_datados = []
-    acumulado = leftover
-    status = "DESCOBERTO"
-    cobriu_em = None
-    for _, row in dated.iterrows():
-        acumulado += row["qtde"]
-        cruzou = cobriu_em is None and acumulado >= qtde_saldo
-        evento = {
-            "tipo": "projetado",
-            "of": row["of"],
-            "data": _to_date(row["data_projecao"]),
-            "qtde": row["qtde"],
-            "acumulado": acumulado,
-            "cobriu": cruzou,
-        }
-        eventos_datados.append(evento)
-        if cruzou:
-            status = "COB"
-            cobriu_em = evento
-
-    eventos_sem_data = [
-        {"tipo": "sem_data", "of": row["of"], "qtde": row["qtde"]}
-        for _, row in undated.iterrows()
-    ]
-
-    if status != "COB":
-        acumulado_total = leftover + ofs["qtde"].sum()
-        if dated.empty:
-            status = "SEMOF"
-        elif acumulado_total >= qtde_saldo:
-            status = "COMOF"
-        else:
-            status = "STKSEMOF"
-        acumulado = acumulado_total
-
-    return eventos_datados, eventos_sem_data, acumulado, status
+                a.data_periodo_inicial,
+                DATE_ADD(p.data_periodo_final, INTERVAL 1 DAY) AS data_periodo_inicial_ajustado
+            FROM cfg_atual a
+            CROSS JOIN cfg_anterior p
+        )
+        SELECT
+            ODF.`of`,
+            MAX(SD2.emissao) AS data_cobertura
+        FROM ordem_fabricacao ODF
+        JOIN CFG ON 1 = 1
+        JOIN totvs_sd2 SD2
+            ON SD2.`of` = ODF.`of`
+           AND SD2.numpedcomp = SUBSTRING_INDEX(ODF.oc_linha, '/', 1)
+           AND SD2.itempedcom <> ''
+           AND CAST(SD2.itempedcom AS UNSIGNED) = CAST(SUBSTRING_INDEX(ODF.oc_linha, '/', -1) AS UNSIGNED)
+           AND SD2.cliente IN (6, 7, 8)
+           AND SD2.emissao BETWEEN CFG.data_periodo_inicial_ajustado AND LAST_DAY(CFG.data_periodo_inicial)
+        WHERE ODF.`of` IN :ofs
+        GROUP BY ODF.`of`
+    """).bindparams(bindparam("ofs", expanding=True))
+    return pd.read_sql(stmt, engine, params={"ofs": ofs})
 
 
-STATUS_INFO = {
-    "COBERTO": {"cor": "verde", "label": "Coberto", "desc": "O saldo desse pn ja foi totalmente atendido."},
-    "COB": {"cor": "azul", "label": "Cobertura projetada", "desc": "Ainda nao chegou, mas ha OFs com data prevista que fecham o saldo."},
-    "COMOF": {"cor": "laranja", "label": "Cobertura parcial (falta OF sem data)", "desc": "Some tudo (com e sem data) e da o saldo, mas parte depende de OF que ainda nao tem data prevista."},
-    "STKSEMOF": {"cor": "vermelho", "label": "Insuficiente mesmo somando tudo", "desc": "Mesmo somando todas as OFs pendentes (com e sem data), nao fecha o saldo."},
-    "SEMOF": {"cor": "vermelho", "label": "Sem nenhuma OF com data", "desc": "Nenhuma das OFs pendentes desse pn tem data prevista de entrega."},
-    "DESCOBERTO": {"cor": "cinza", "label": "Descoberto", "desc": "Nao ha OF nem nota que aponte quando esse pn sera atendido."},
-}
+def _datas_simul(ofs: list) -> pd.DataFrame:
+    """de_simul (objeto_dezena_atual) das OFs informadas."""
+    if not ofs:
+        return pd.DataFrame(columns=["of", "de_simul"])
+    stmt = text("""
+        SELECT `of`, MAX(de_simul) AS de_simul
+        FROM objeto_dezena_atual
+        WHERE `of` IN :ofs
+        GROUP BY `of`
+    """).bindparams(bindparam("ofs", expanding=True))
+    return pd.read_sql(stmt, engine, params={"ofs": ofs})
 
 
-def analisar(pn: str, fonte: str = "auto"):
+def analisar(pn: str):
     df1 = passo1_pn(pn)
     if df1.empty:
         return None
@@ -177,71 +147,96 @@ def analisar(pn: str, fonte: str = "auto"):
     qtde_saldo = float(df1.iloc[0]["qtde_saldo"])
     stts_sistema = df1.iloc[0]["stts_atendimento"]
 
-    df2 = passo2_emissao_sd2([pn])
-    eventos_reais, acumulado_real, cobriu_real = montar_historico_real(pn, qtde_saldo, df2)
-    ofs_usadas = set(df2.dropna(subset=["emissao"])["of"].unique())
+    hist = _historico_extrato(pn)
 
-    eventos_projetados, eventos_sem_data, acumulado_final, status_projecao = [], [], acumulado_real, None
-
-    if cobriu_real is not None:
-        status_analise = "COBERTO"
-        data_cobertura = cobriu_real["data"]
-        of_cobertura = cobriu_real["of"]
-        acumulado_final = acumulado_real
-    elif stts_sistema == "COBERTO":
-        status_analise = "COBERTO"
-        data_cobertura = None
-        of_cobertura = None
-        acumulado_final = acumulado_real
-    elif stts_sistema == "DESCOBERTO":
-        eventos_projetados, eventos_sem_data, acumulado_final, status_projecao = montar_projecao(
-            pn, qtde_saldo, acumulado_real, ofs_usadas, fonte=fonte
-        )
-        status_analise = status_projecao
-        cobriu_proj = next((e for e in eventos_projetados if e["cobriu"]), None)
-        data_cobertura = cobriu_proj["data"] if cobriu_proj else None
-        of_cobertura = cobriu_proj["of"] if cobriu_proj else None
+    if hist.empty:
+        # pn nem aparece no extrato de cobertura: confia no status do sistema
+        # (mesma regra de fallback da view, quando nao ha OF nenhuma conhecida)
+        status_final = "COBERTO" if stts_sistema == "COBERTO" else "DESCOBERTO"
+        of_final = None
+        data_final = None
+        acumulado_final = 0.0
+        eventos = []
     else:
-        status_analise = "DESCOBERTO"
-        data_cobertura = None
-        of_cobertura = None
+        ofs_reais = hist.loc[hist["categoria"].isin(REAIS), "of"].tolist()
+        ofs_pendentes = hist.loc[~hist["categoria"].isin(REAIS), "of"].tolist()
+        datas_reais = _datas_sd2(ofs_reais)
+        datas_simul = _datas_simul(ofs_pendentes)
+        hist = hist.merge(datas_reais, on="of", how="left").merge(datas_simul, on="of", how="left")
 
-    status_simplificado = "COBERTO" if status_analise == "COBERTO" else "DESCOBERTO"
+        hoje = pd.Timestamp.now().normalize()
+        eventos = []
+        for _, row in hist.iterrows():
+            eh_real = row["categoria"] in REAIS
+            if eh_real:
+                data = _to_date(row.get("data_cobertura"))
+            else:
+                de_simul = pd.to_datetime(row.get("de_simul"), errors="coerce")
+                data = _to_date(de_simul) if pd.notna(de_simul) and de_simul >= hoje else None
+            eventos.append({
+                "tipo": "real" if eh_real else "projetado",
+                "of": row["of"],
+                "categoria": row["categoria"],
+                "categoria_label": CATEGORIA_LABEL.get(row["categoria"], row["categoria"]),
+                "data": data,
+                "qtde": float(row["qtd_of"]),
+                "acumulado": max(qtde_saldo - float(row["saldo_final_pn"]), 0),
+                "cobriu": bool(row["saldo_final_pn"] <= 0),
+            })
+
+        ultima = hist.iloc[-1]
+        ultima_real = ultima["categoria"] in REAIS
+        ultima_data = eventos[-1]["data"]
+
+        if ultima_real and ultima_data is not None:
+            # achou a nota real na SD2: cobertura confirmada
+            status_final = "COBERTO"
+            of_final = ultima["of"]
+            data_final = ultima_data
+            acumulado_final = max(qtde_saldo - float(ultima["saldo_final_pn"]), 0)
+        elif not ultima_real:
+            # ainda pendente: status = a propria categoria do extrato
+            status_final = ultima["categoria"]
+            of_final = ultima["of"]
+            data_final = ultima_data
+            acumulado_final = max(qtde_saldo - float(ultima["saldo_final_pn"]), 0)
+        else:
+            # categoria ROMANEIO/NF mas a nota nao foi achada na SD2 dentro
+            # do periodo: mesmo fallback da view, confia no status do sistema
+            status_final = "COBERTO" if stts_sistema == "COBERTO" else "DESCOBERTO"
+            of_final = None
+            data_final = None
+            acumulado_final = 0.0
+
+    status_simplificado = "COBERTO" if status_final == "COBERTO" else "DESCOBERTO"
     comparativo = "OK" if status_simplificado == stts_sistema else "DIVERGENTE"
-
-    linha_do_tempo = eventos_reais + eventos_projetados
     percentual = min(100, round((acumulado_final / qtde_saldo) * 100, 1)) if qtde_saldo else 100
 
     return {
         "pn": pn,
-        "fonte": fonte,
         "qtde_saldo": qtde_saldo,
         "stts_sistema": stts_sistema,
-        "status_analise": status_analise,
-        "status_info": STATUS_INFO.get(status_analise, STATUS_INFO["DESCOBERTO"]),
+        "status_analise": status_final,
+        "status_info": STATUS_INFO.get(status_final, STATUS_INFO["DESCOBERTO"]),
         "comparativo": comparativo,
-        "data_cobertura": data_cobertura,
-        "of_cobertura": of_cobertura,
+        "data_cobertura": data_final,
+        "of_cobertura": of_final,
         "acumulado_final": acumulado_final,
         "percentual": percentual,
-        "linha_do_tempo": linha_do_tempo,
-        "ofs_sem_data": eventos_sem_data,
+        "linha_do_tempo": eventos,
     }
 
 
 @app.route("/")
 def index():
     pn = request.args.get("pn", "").strip()
-    fonte = request.args.get("fonte", "auto")
-    if fonte not in ("auto", "simulado"):
-        fonte = "auto"
     resultado = None
     erro = None
     if pn:
-        resultado = analisar(pn, fonte=fonte)
+        resultado = analisar(pn)
         if resultado is None:
             erro = f"O pn '{pn}' nao foi encontrado em pn_cobertura_atual."
-    return render_template("analise_pn.html", pn=pn, fonte=fonte, resultado=resultado, erro=erro)
+    return render_template("analise_pn.html", pn=pn, resultado=resultado, erro=erro)
 
 
 if __name__ == "__main__":

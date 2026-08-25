@@ -265,15 +265,8 @@
 
   <form class="busca" method="get" action="/">
     <input type="text" name="pn" placeholder="Digite o pn (ex: 123456-01)" value="{{ pn }}" autofocus>
-    <input type="hidden" name="fonte" value="{{ fonte }}">
     <button type="submit">Buscar</button>
   </form>
-
-  <div class="fonte-toggle">
-    <span class="fonte-toggle-label">Fonte da projeção:</span>
-    <a href="/?pn={{ pn|urlencode }}&fonte=auto" class="fonte-opcao {% if fonte == 'auto' %}ativa{% endif %}">Previsão de faturamento</a>
-    <a href="/?pn={{ pn|urlencode }}&fonte=simulado" class="fonte-opcao {% if fonte == 'simulado' %}ativa{% endif %}">Simulação de manufatura (de_simul)</a>
-  </div>
 
   {% if erro %}
     <div class="erro">{{ erro }}</div>
@@ -312,7 +305,7 @@
           {% if r.status_analise == "COBERTO" %}
             ✅ Coberto em <strong>{{ r.data_cobertura.strftime("%d/%m/%Y") }}</strong> pela OF <strong>{{ r.of_cobertura }}</strong>.
           {% else %}
-            🔵 Previsao de cobertura em <strong>{{ r.data_cobertura.strftime("%d/%m/%Y") }}</strong> pela OF <strong>{{ r.of_cobertura }}</strong> (ainda nao aconteceu) — data {{ "simulada pela manufatura" if r.fonte == "simulado" else "de previsão de faturamento" }}.
+            🔵 Previsao de cobertura em <strong>{{ r.data_cobertura.strftime("%d/%m/%Y") }}</strong> pela OF <strong>{{ r.of_cobertura }}</strong> (ainda nao aconteceu) — data simulada pela manufatura.
           {% endif %}
         </div>
       {% elif r.status_analise == "COBERTO" %}
@@ -331,7 +324,7 @@
               <div class="evento-card">
                 <div class="evento-linha1">
                   <span>OF {{ ev.of }}</span>
-                  <span class="evento-tag">{{ "Nota real" if ev.tipo == "real" else ("Simulação manufatura" if r.fonte == "simulado" else "Previsão faturamento") }}</span>
+                  <span class="evento-tag">{{ ev.categoria_label }}</span>
                 </div>
                 <div class="evento-detalhe">
                   {{ ev.data.strftime("%d/%m/%Y") if ev.data else "sem data" }}

@@ -59,15 +59,47 @@ def passo1_pn_cobertura_atual() -> pd.DataFrame:
     return df
 
 
-def passo2_emissao_sd2(pns: list) -> pd.DataFrame:
-    """ODF + CFG + SD2: para cada pn, verifica se ha emissao na SD2 no periodo atual.
+def passo2_extrato_cobertura(pns: list) -> pd.DataFrame:
+    """pn_extrato_cobertura: linha que fecha a conta de cada pn (MAX id), com a
+    OF, categoria (ROMANEIO/NF = cobertura real; DESCOBERTO_MANUFATURA/DESCOBERTO
+    = ainda pendente) e saldo_final_pn.
 
-    Usa ordem_fabricacao (pn -> of) em vez de pn_extrato_cobertura, pois esta
-    ultima nao lista o pn quando ele ja foi coberto. O join com a SD2 tambem
-    exige numpedcomp/itempedcom = as duas partes de ordem_fabricacao.oc_linha
-    (ex: "906245296/00010"), para nao pegar linhas da SD2 do mesmo `of` que
-    sejam de outro pedido/item (ex: consumo de material).
+    Usa manufatura.pn_extrato_cobertura.ordem_fabricacao em vez de ordem_fabricacao
+    (pn -> of): agora so usamos as OFs que o proprio extrato de cobertura ja
+    definiu, sem recalcular por conta propria quais OFs cobrem o pn.
     """
+    stmt = text("""
+        SELECT PEC.pn, PEC.ordem_fabricacao AS `of`, PEC.categoria, PEC.saldo_final_pn
+        FROM pn_extrato_cobertura PEC
+        JOIN (
+            SELECT pn, MAX(id) AS max_id
+            FROM pn_extrato_cobertura
+            WHERE pn IN :pns
+            GROUP BY pn
+        ) M ON M.pn = PEC.pn AND M.max_id = PEC.id
+    """).bindparams(bindparam("pns", expanding=True))
+
+    df = pd.read_sql(stmt, engine, params={"pns": pns})
+    print(f"\n=== Passo 2: pn_extrato_cobertura, linha que fecha a conta ({len(pns)} pn) ===")
+    print(df)
+    print("\n--- Resumo: categoria da linha determinante ---")
+    print(df["categoria"].value_counts())
+    return df
+
+
+def passo3_data_cobertura(df_extrato: pd.DataFrame) -> pd.DataFrame:
+    """Para categoria ROMANEIO/NF (cobertura real), cruza a OF do extrato com a
+    SD2 pra achar a data real da nota. O join exige numpedcomp/itempedcom = as
+    duas partes de ordem_fabricacao.oc_linha (ex: "906245296/00010"), para nao
+    pegar linhas da SD2 do mesmo `of` que sejam de outro pedido/item, e
+    cliente IN (6,7,8) = Embraer, dentro do periodo CFG (mesmo filtro de sempre).
+    """
+    cobertas = df_extrato[df_extrato["categoria"].isin(["ROMANEIO", "NF"])].copy()
+    if cobertas.empty:
+        print("\n=== Passo 3: nenhum pn com categoria ROMANEIO/NF ===")
+        return pd.DataFrame(columns=["pn", "of_cobertura", "data_cobertura"])
+
+    ofs = cobertas["of"].tolist()
     stmt = text("""
         WITH cfg_islands AS (
             -- agrupa execucoes consecutivas (por id) com o mesmo data_periodo_final,
@@ -109,222 +141,92 @@ def passo2_emissao_sd2(pns: list) -> pd.DataFrame:
             CROSS JOIN cfg_anterior p
         )
         SELECT
-            PNAT.pn,
             ODF.`of`,
-            SD2.emissao,
-            SD2.quantidade
-        FROM pn_cobertura_atual PNAT
-        LEFT JOIN ordem_fabricacao ODF ON ODF.pn = PNAT.pn
+            MAX(SD2.emissao) AS data_cobertura
+        FROM ordem_fabricacao ODF
         JOIN CFG ON 1 = 1
-        LEFT JOIN totvs_sd2 SD2
+        JOIN totvs_sd2 SD2
             ON SD2.`of` = ODF.`of`
            AND SD2.numpedcomp = SUBSTRING_INDEX(ODF.oc_linha, '/', 1)
            AND SD2.itempedcom <> ''
            AND CAST(SD2.itempedcom AS UNSIGNED) = CAST(SUBSTRING_INDEX(ODF.oc_linha, '/', -1) AS UNSIGNED)
            AND SD2.cliente IN (6, 7, 8)
            AND SD2.emissao BETWEEN CFG.data_periodo_inicial_ajustado AND LAST_DAY(CFG.data_periodo_inicial)
-        WHERE PNAT.pn IN :pns
-        ORDER BY PNAT.pn, SD2.emissao, ODF.`of`
-    """).bindparams(bindparam("pns", expanding=True))
+        WHERE ODF.`of` IN :ofs
+        GROUP BY ODF.`of`
+    """).bindparams(bindparam("ofs", expanding=True))
+    datas = pd.read_sql(stmt, engine, params={"ofs": ofs})
 
-    df = pd.read_sql(stmt, engine, params={"pns": pns})
-    com_emissao = df[df["emissao"].notna()]
-    sem_emissao = len(df) - len(com_emissao)
-    print(f"\n=== Passo 2: ordem_fabricacao + totvs_sd2 (primeiros {len(pns)} pn) ===")
-    print(com_emissao)
-    if sem_emissao:
-        print(f"(+ {sem_emissao} OF sem nota no periodo, omitidas)")
-
-    resumo = (
-        df.assign(tem_emissao=df["emissao"].notna())
-        .groupby("pn")["tem_emissao"]
-        .any()
-        .reset_index()
+    resultado_df = (
+        cobertas.merge(datas, on="of", how="left")
+        .rename(columns={"of": "of_cobertura"})[["pn", "of_cobertura", "data_cobertura"]]
     )
-    print("\n--- Resumo: pn tem emissao na SD2 no periodo? ---")
-    print(resumo)
-    return df
-
-
-def passo3_data_cobertura(df_saldo: pd.DataFrame, df_notas: pd.DataFrame) -> pd.DataFrame:
-    """Acumula a quantidade das notas por pn ate atingir o qtde_saldo.
-
-    Uma "nota" e o par (of, emissao); quando ha mais de uma linha na SD2 para
-    a mesma nota, usa a maior quantidade (mesmo criterio da view: MAX por
-    pn+emissao+of). Soma as notas em ordem de emissao ate o acumulado igualar
-    ou superar o qtde_saldo do pn: essa e a data_cobertura. Se nunca atingir,
-    o pn fica DESCOBERTO.
-    """
-    saldo_por_pn = df_saldo.set_index("pn")["qtde_saldo"]
-
-    notas = (
-        df_notas.dropna(subset=["emissao"])
-        .astype({"quantidade": "float64"})
-        .groupby(["pn", "of", "emissao"], as_index=False)["quantidade"]
-        .max()
-        .sort_values(["pn", "emissao", "of"])
-    )
-    notas["qtde_acumulada"] = notas.groupby("pn")["quantidade"].cumsum()
-
-    resultados = []
-    for pn, qtde_saldo in saldo_por_pn.items():
-        pn_notas = notas[notas["pn"] == pn]
-        cobertas = pn_notas[pn_notas["qtde_acumulada"] >= qtde_saldo]
-        if not cobertas.empty:
-            primeira = cobertas.iloc[0]
-            resultados.append({
-                "pn": pn,
-                "qtde_saldo": qtde_saldo,
-                "data_cobertura": primeira["emissao"].strftime("%Y-%m-%d"),
-                "of_cobertura": primeira["of"],
-                "qtde_acumulada": primeira["qtde_acumulada"],
-            })
-        else:
-            resultados.append({
-                "pn": pn,
-                "qtde_saldo": qtde_saldo,
-                "data_cobertura": "DESCOBERTO",
-                "of_cobertura": None,
-                "qtde_acumulada": pn_notas["qtde_acumulada"].max() if not pn_notas.empty else 0,
-            })
-
-    resultado_df = pd.DataFrame(resultados)
-    print("\n=== Passo 3: data de cobertura por pn ===")
+    print("\n=== Passo 3: data real de cobertura via SD2 (so categoria ROMANEIO/NF) ===")
     print(resultado_df)
     return resultado_df
 
 
-def passo4_projecao_faturamento(df_passo3: pd.DataFrame, df_notas: pd.DataFrame) -> pd.DataFrame:
-    """Para os pn ainda DESCOBERTO, continua acumulando com OFs projetadas.
-
-    Quantidade agora vem de ordem_fabricacao.qtde (nao mais da SD2). A data
-    usada e vwf_previsao_faturamento.Emissao (Nro Doc = of); se nula ou no
-    passado, cai no fallback objeto_dezena_atual.de_simul (join por of) - se
-    esse tambem estiver no passado, nao usa (fica sem data ali). Nao faz
-    sentido "cobrir no passado": se a previsao de faturamento venceu e nunca
-    virou nota real, ela nao serve mais como projecao. OFs que ja tinham
-    nota real (SD2) contabilizada no passo 3 sao excluidas para nao contar
-    a mesma quantidade duas vezes. So entram no calculo OFs que existem em
-    objeto_dezena_atual (join obrigatorio); OFs fora dessa tabela nao sao
-    consideradas nem sequer como "sem data".
-
-    Primeiro tenta cobrir o saldo somando so as OFs COM data, em ordem
-    cronologica (status COB, com data_projetada real). Se as OFs com data
-    nao bastarem sozinhas, classifica em um dos 3 status abaixo (sem data
-    de projecao, pois nao ha como saber quando isso sera coberto):
-    - SEMOF: nenhuma OF pendente desse pn tem data, independente da soma
-      bater o saldo ou nao.
-    - COMOF: ha pelo menos 1 OF com data, e a soma de TODAS as OFs
-      pendentes (com + sem data) ja bate o saldo, mas parte necessaria
-      vem de OF(s) sem data.
-    - STKSEMOF: ha pelo menos 1 OF com data, mas mesmo somando todas as
-      OFs pendentes (com + sem data) o total ainda fica abaixo do saldo.
+def passo4_projecao_de_simul(df_extrato: pd.DataFrame) -> pd.DataFrame:
+    """Para categoria fora de ROMANEIO/NF (ainda pendente: DESCOBERTO_MANUFATURA,
+    DESCOBERTO, etc), projeta a data so com a OF do extrato (objeto_dezena_atual.
+    de_simul), sem somar outras OFs pendentes do pn. Nao faz sentido "cobrir no
+    passado": ignora de_simul anterior a hoje. O status passa a ser a propria
+    categoria do extrato.
     """
-    descobertos = df_passo3[df_passo3["data_cobertura"] == "DESCOBERTO"].copy()
-    if descobertos.empty:
-        print("\n=== Passo 4: nenhum pn DESCOBERTO para projetar ===")
-        return descobertos
+    pendentes = df_extrato[~df_extrato["categoria"].isin(["ROMANEIO", "NF"])].copy()
+    if pendentes.empty:
+        print("\n=== Passo 4: nenhum pn pendente para projetar ===")
+        return pd.DataFrame(columns=["pn", "of_projecao", "data_projetada", "status"])
 
-    pns = descobertos["pn"].tolist()
-
+    ofs = pendentes["of"].tolist()
     stmt = text("""
-        SELECT
-            ODF.pn,
-            ODF.`of`,
-            ODF.qtde,
-            MAX(PFAT.`Emissão`) AS pfat_emissao,
-            MAX(OBJD.de_simul) AS objd_de_simul
-        FROM ordem_fabricacao ODF
-        LEFT JOIN pbi.vwf_previsao_faturamento PFAT ON PFAT.`Nro Doc` = ODF.`of`
-        LEFT JOIN objeto_dezena_atual OBJD ON OBJD.`of` = ODF.`of`
-        WHERE ODF.pn IN :pns
-          AND (
-            PFAT.`Nro Doc` IS NOT NULL
-            OR OBJD.`of` IS NOT NULL
-          )
-        GROUP BY ODF.pn, ODF.`of`, ODF.qtde
-    """).bindparams(bindparam("pns", expanding=True))
-    ofs = pd.read_sql(stmt, engine, params={"pns": pns})
-    ofs["qtde"] = ofs["qtde"].fillna(0)
+        SELECT `of`, MAX(de_simul) AS de_simul
+        FROM objeto_dezena_atual
+        WHERE `of` IN :ofs
+        GROUP BY `of`
+    """).bindparams(bindparam("ofs", expanding=True))
+    simul = pd.read_sql(stmt, engine, params={"ofs": ofs})
 
     hoje = pd.Timestamp.now().normalize()
-    pfat_emissao = pd.to_datetime(ofs["pfat_emissao"], errors="coerce")
-    pfat_emissao = pfat_emissao.where(pfat_emissao >= hoje)
-    objd_de_simul = pd.to_datetime(ofs["objd_de_simul"], errors="coerce")
-    objd_de_simul = objd_de_simul.where(objd_de_simul >= hoje)
-    ofs["data_projecao"] = pfat_emissao.combine_first(objd_de_simul)
+    merged = pendentes.merge(simul, on="of", how="left")
+    de_simul = pd.to_datetime(merged["de_simul"], errors="coerce")
+    merged["data_projetada"] = de_simul.where(de_simul >= hoje)
 
-    ofs_ja_usadas = df_notas.dropna(subset=["emissao"])[["pn", "of"]].drop_duplicates()
-    ofs = ofs.merge(ofs_ja_usadas.assign(_usada=True), on=["pn", "of"], how="left")
-    ofs = ofs[ofs["_usada"].isna()].drop(columns="_usada")
-
-    ofs = ofs.sort_values(["pn", "data_projecao"], na_position="last")
-
-    resultados = []
-    for _, linha in descobertos.iterrows():
-        pn = linha["pn"]
-        qtde_saldo = linha["qtde_saldo"]
-        leftover = linha["qtde_acumulada"]
-        pn_ofs = ofs[ofs["pn"] == pn]
-        dated = pn_ofs[pn_ofs["data_projecao"].notna()].sort_values("data_projecao")
-
-        status = "DESCOBERTO"
-        data_projetada = None
-        of_projecao = None
-        acumulado = leftover
-
-        # tenta cobrir so com OFs com data, em ordem cronologica
-        for _, of_linha in dated.iterrows():
-            acumulado += of_linha["qtde"]
-            if acumulado >= qtde_saldo:
-                of_projecao = of_linha["of"]
-                status = "COB"
-                data_projetada = of_linha["data_projecao"].strftime("%Y-%m-%d")
-                break
-
-        if status == "DESCOBERTO":
-            acumulado = leftover + pn_ofs["qtde"].sum()
-            if dated.empty:
-                status = "SEMOF"
-            elif acumulado >= qtde_saldo:
-                status = "COMOF"
-            else:
-                status = "STKSEMOF"
-
-        resultados.append({
-            "pn": pn,
-            "qtde_saldo": qtde_saldo,
-            "qtde_acumulada_final": acumulado,
-            "status": status,
-            "data_projetada": data_projetada,
-            "of_projecao": of_projecao,
-        })
-
-    resultado_df = pd.DataFrame(resultados)
-    print("\n=== Passo 4: projecao via previsao_faturamento / objeto_dezena_atual ===")
+    resultado_df = merged.rename(columns={"of": "of_projecao", "categoria": "status"})[
+        ["pn", "of_projecao", "data_projetada", "status"]
+    ]
+    print("\n=== Passo 4: projecao via objeto_dezena_atual.de_simul (so OF do extrato) ===")
     print(resultado_df)
     return resultado_df
 
 
 def monta_resultado_final(
-    df_passo1: pd.DataFrame, df_passo3: pd.DataFrame, df_passo4: pd.DataFrame
+    df_passo1: pd.DataFrame,
+    df_extrato: pd.DataFrame,
+    df_passo3: pd.DataFrame,
+    df_passo4: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Combina stts_atendimento (do sistema) com a nossa analise (passo 3 + passo 4).
+    """Combina stts_atendimento (do sistema) com a nossa analise (categoria do
+    extrato de cobertura + data real via SD2, ou projecao via de_simul).
 
-    Regra:
-    - stts_atendimento == 'COBERTO': tentamos achar a data via passo 3 (nota
-      real na SD2). Nao projeta (passo 4). Se nao achar a nota, confia no
-      status do sistema mesmo assim (status_analise = COBERTO) e deixa
-      data/of em branco.
-    - stts_atendimento == 'DESCOBERTO': o passo 3 ja diz se, na pratica, ja
-      foi coberto por uma nota real; se ainda nao foi, usamos o passo 4 para
-      projetar quando vai cobrir.
+    Regra, por pn:
+    - se a linha determinante do extrato (passo 2) e ROMANEIO/NF, status =
+      COBERTO, com a data real vinda do passo 3 (pode ficar sem data se a
+      nota nao foi encontrada na SD2 dentro do periodo).
+    - senao, se o sistema ja diz COBERTO, mantem COBERTO mas sem data (nao
+      projeta - mesma regra da view: confia no status do sistema mesmo sem
+      achar a nota real).
+    - senao, usa a projecao do passo 4 (status = categoria do extrato, data =
+      de_simul se houver e for futura).
+    - se o pn nem aparece no extrato, fica DESCOBERTO sem data.
 
     Cria a coluna `comparativo`: OK quando a nossa analise (simplificada em
     COBERTO/DESCOBERTO) bate com o stts_atendimento do sistema, DIVERGENTE
     caso contrario.
     """
+    cobertura = df_passo3.set_index("pn") if not df_passo3.empty else None
     projecao = df_passo4.set_index("pn") if not df_passo4.empty else None
+    saldo_final = df_extrato.set_index("pn")["saldo_final_pn"] if not df_extrato.empty else pd.Series(dtype=float)
 
     resultados = []
     for _, linha in df_passo1.iterrows():
@@ -332,32 +234,27 @@ def monta_resultado_final(
         stts = linha["stts_atendimento"]
         qtde_saldo = linha["qtde_saldo"]
 
-        linha3 = df_passo3[df_passo3["pn"] == pn].iloc[0]
-        achou_real = linha3["data_cobertura"] != "DESCOBERTO"
-
-        if achou_real:
+        if cobertura is not None and pn in cobertura.index:
+            c = cobertura.loc[pn]
             status_nossa = "COBERTO"
-            data_nossa = linha3["data_cobertura"]
-            of_nossa = linha3["of_cobertura"]
-            qtde_nossa = linha3["qtde_acumulada"]
+            data_nossa = c["data_cobertura"]
+            of_nossa = c["of_cobertura"]
         elif stts == "COBERTO":
-            # sistema diz coberto; mesmo sem achar a nota real, confia no
-            # status e so deixa a data/of em branco (nao projeta)
             status_nossa = "COBERTO"
             data_nossa = None
             of_nossa = None
-            qtde_nossa = linha3["qtde_acumulada"]
         elif projecao is not None and pn in projecao.index:
             p = projecao.loc[pn]
             status_nossa = p["status"]
             data_nossa = p["data_projetada"]
             of_nossa = p["of_projecao"]
-            qtde_nossa = p["qtde_acumulada_final"]
         else:
             status_nossa = "DESCOBERTO"
             data_nossa = None
             of_nossa = None
-            qtde_nossa = linha3["qtde_acumulada"]
+
+        saldo_f = saldo_final.get(pn, qtde_saldo)
+        qtde_nossa = max(qtde_saldo - saldo_f, 0)
 
         status_simplificado = "COBERTO" if status_nossa == "COBERTO" else "DESCOBERTO"
         comparativo = "OK" if status_simplificado == stts else "DIVERGENTE"
@@ -384,14 +281,8 @@ def monta_resultado_final(
 if __name__ == "__main__":
     df_passo1 = passo1_pn_cobertura_atual()
     todos_pns = df_passo1["pn"].tolist()
-    df_passo2 = passo2_emissao_sd2(todos_pns)
-    df_passo3 = passo3_data_cobertura(df_passo1, df_passo2)
+    df_extrato = passo2_extrato_cobertura(todos_pns)
+    df_passo3 = passo3_data_cobertura(df_extrato)
+    df_passo4 = passo4_projecao_de_simul(df_extrato)
 
-    # so projeta (passo 4) os pn que o sistema ainda considera DESCOBERTO
-    pns_descoberto_sistema = df_passo1.loc[df_passo1["stts_atendimento"] == "DESCOBERTO", "pn"]
-    df_passo3_para_projecao = df_passo3[
-        df_passo3["pn"].isin(pns_descoberto_sistema) & (df_passo3["data_cobertura"] == "DESCOBERTO")
-    ]
-    df_passo4 = passo4_projecao_faturamento(df_passo3_para_projecao, df_passo2)
-
-    monta_resultado_final(df_passo1, df_passo3, df_passo4)
+    monta_resultado_final(df_passo1, df_extrato, df_passo3, df_passo4)

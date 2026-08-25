@@ -45,156 +45,55 @@ CFG AS (
   CROSS JOIN cfg_anterior p
 ),
 
--- Passo 2/3: notas reais na SD2 (via ordem_fabricacao, nao pn_extrato_cobertura)
--- numpedcomp/itempedcom precisam bater com as duas partes de oc_linha (ex:
--- "906245296/00010"), senao pega linha da SD2 do mesmo `of` de outro pedido/item.
--- cliente IN (6,7,8) = Embraer (mesmo filtro de vw_totvs_sd2_embraer); sem isso,
--- o match por of+numpedcomp+itempedcom pode coincidir com nota de outro cliente
-notas_sd2 AS (
+-- linha de pn_extrato_cobertura que fecha a conta de cada pn: MAX(id) e a
+-- ultima OF da caminhada que o processo de extrato ja fez ate o saldo bater
+-- (ou a ultima tentativa conhecida, quando nem somando tudo cobre)
+extrato_atual AS (
+  SELECT PEC.pn, PEC.ordem_fabricacao AS `of`, PEC.categoria, PEC.saldo_final_pn
+  FROM manufatura.pn_extrato_cobertura PEC
+  JOIN (
+    SELECT pn, MAX(id) AS max_id
+    FROM manufatura.pn_extrato_cobertura
+    GROUP BY pn
+  ) M ON M.pn = PEC.pn AND M.max_id = PEC.id
+),
+
+-- categoria ROMANEIO/NF = cobertura real; cruza essa OF com a SD2 pra achar a
+-- data real da nota (oc_linha vem de ordem_fabricacao pelo `of`; mesmo filtro
+-- de sempre: numpedcomp/itempedcom batendo com oc_linha, cliente Embraer
+-- IN (6,7,8), dentro do periodo CFG)
+cobertura_sd2 AS (
   SELECT
-    PNAT.pn,
-    ODF.`of`,
-    SD2.emissao,
-    MAX(SD2.quantidade) AS quantidade
-  FROM pn_cobertura_atual PNAT
-  JOIN ordem_fabricacao ODF ON ODF.pn = PNAT.pn
+    EA.pn,
+    EA.`of` AS of_cobertura,
+    MAX(SD2.emissao) AS data_cobertura
+  FROM extrato_atual EA
+  JOIN ordem_fabricacao ODF ON ODF.`of` = EA.`of`
   JOIN CFG ON 1 = 1
   JOIN totvs_sd2 SD2
-    ON SD2.`of` = ODF.`of`
+    ON SD2.`of` = EA.`of`
    AND SD2.numpedcomp = SUBSTRING_INDEX(ODF.oc_linha, '/', 1)
    AND SD2.itempedcom <> ''
    AND CAST(SD2.itempedcom AS UNSIGNED) = CAST(SUBSTRING_INDEX(ODF.oc_linha, '/', -1) AS UNSIGNED)
    AND SD2.cliente IN (6, 7, 8)
    AND SD2.emissao BETWEEN CFG.data_periodo_inicial_ajustado AND LAST_DAY(CFG.data_periodo_inicial)
-  GROUP BY PNAT.pn, ODF.`of`, SD2.emissao
+  WHERE EA.categoria IN ('ROMANEIO', 'NF')
+  GROUP BY EA.pn, EA.`of`
 ),
 
-notas_sd2_acumulado AS (
-  SELECT
-    pn,
-    `of`,
-    emissao,
-    quantidade,
-    SUM(quantidade) OVER (
-      PARTITION BY pn
-      ORDER BY emissao, `of`
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS qtde_acumulada
-  FROM notas_sd2
-),
-
--- Passo 3: primeira nota que cobre o saldo (se houver)
-notas_sd2_rank AS (
-  SELECT
-    NA.pn,
-    NA.`of`,
-    NA.emissao,
-    NA.qtde_acumulada,
-    ROW_NUMBER() OVER (PARTITION BY NA.pn ORDER BY NA.emissao, NA.`of`) AS rn
-  FROM notas_sd2_acumulado NA
-  JOIN pn_cobertura_atual PNAT ON PNAT.pn = NA.pn
-  WHERE NA.qtde_acumulada >= PNAT.qtde_saldo
-),
-
-cobertura_sd2 AS (
-  SELECT
-    pn,
-    `of` AS of_cobertura,
-    emissao AS data_cobertura,
-    qtde_acumulada
-  FROM notas_sd2_rank
-  WHERE rn = 1
-),
-
--- pn ainda sem cobertura na SD2, com o acumulado que ja tinham (para continuar do mesmo ponto)
-sd2_leftover AS (
-  SELECT
-    PNAT.pn,
-    PNAT.qtde_saldo,
-    COALESCE(MAX(NA.qtde_acumulada), 0) AS qtde_acumulada_leftover
-  FROM pn_cobertura_atual PNAT
-  LEFT JOIN notas_sd2_acumulado NA ON NA.pn = PNAT.pn
-  WHERE PNAT.pn NOT IN (SELECT pn FROM cobertura_sd2)
-  GROUP BY PNAT.pn, PNAT.qtde_saldo
-),
-
--- Passo 4: OFs ainda nao usadas na SD2, com data projetada (previsao_faturamento -> fallback objeto_dezena_atual)
-ofs_projetadas AS (
-  SELECT
-    ODF.pn,
-    ODF.`of`,
-    ODF.qtde,
-    CAST(MAX(PFAT.`Emissão`) AS DATE) AS pfat_emissao,
-    CAST(MAX(OBJD.de_simul) AS DATE) AS objd_de_simul
-  FROM ordem_fabricacao ODF
-  JOIN sd2_leftover SL ON SL.pn = ODF.pn
-  LEFT JOIN pbi.vwf_previsao_faturamento PFAT ON PFAT.`Nro Doc` = ODF.`of`
-  LEFT JOIN objeto_dezena_atual OBJD ON OBJD.`of` = ODF.`of`
-  LEFT JOIN notas_sd2 NS ON NS.pn = ODF.pn AND NS.`of` = ODF.`of`
-  WHERE NS.`of` IS NULL
-  GROUP BY ODF.pn, ODF.`of`, ODF.qtde
-),
-
--- nao faz sentido "cobrir no passado": ignora pfat_emissao/objd_de_simul
--- anteriores a hoje (previsao vencida que nunca virou nota real)
-ofs_projetadas_calc AS (
-  SELECT
-    pn,
-    `of`,
-    qtde,
-    COALESCE(
-      CASE WHEN pfat_emissao >= CURDATE() THEN pfat_emissao END,
-      CASE WHEN objd_de_simul >= CURDATE() THEN objd_de_simul END
-    ) AS data_projecao,
-    CASE
-      WHEN pfat_emissao >= CURDATE() THEN 'PROJETADO'
-      WHEN objd_de_simul >= CURDATE() THEN 'PLANEJADO'
-      ELSE NULL
-    END AS fonte_projecao
-  FROM ofs_projetadas
-),
-
-ofs_projetadas_acumulado AS (
-  SELECT
-    pn,
-    `of`,
-    qtde,
-    data_projecao,
-    fonte_projecao,
-    SUM(qtde) OVER (
-      PARTITION BY pn
-      ORDER BY (data_projecao IS NULL), data_projecao, `of`
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS qtde_acumulada_projetada
-  FROM ofs_projetadas_calc
-),
-
-projetadas_rank AS (
-  SELECT
-    OA.pn,
-    OA.`of` AS of_projecao,
-    OA.data_projecao AS data_projetada,
-    OA.fonte_projecao,
-    OA.qtde_acumulada_projetada,
-    SL.qtde_acumulada_leftover,
-    ROW_NUMBER() OVER (
-      PARTITION BY OA.pn
-      ORDER BY (OA.data_projecao IS NULL), OA.data_projecao, OA.`of`
-    ) AS rn
-  FROM ofs_projetadas_acumulado OA
-  JOIN sd2_leftover SL ON SL.pn = OA.pn
-  WHERE OA.qtde_acumulada_projetada >= (SL.qtde_saldo - SL.qtde_acumulada_leftover)
-),
-
+-- categoria fora de ROMANEIO/NF = ainda pendente; projeta a data so com a OF
+-- do extrato (join objeto_dezena_atual.de_simul), sem somar outras OFs do pn.
+-- nao faz sentido "cobrir no passado": ignora de_simul anterior a hoje
+-- status_projecao passa a ser a propria categoria do extrato (DESCOBERTO_MANUFATURA/DESCOBERTO/etc)
 cobertura_projetada AS (
   SELECT
-    pn,
-    of_projecao,
-    data_projetada,
-    (qtde_acumulada_projetada + qtde_acumulada_leftover) AS qtde_acumulada_final,
-    COALESCE(fonte_projecao, 'ERRO') AS status_projecao
-  FROM projetadas_rank
-  WHERE rn = 1
+    EA.pn,
+    EA.`of` AS of_projecao,
+    CASE WHEN OBJD.de_simul >= CURDATE() THEN CAST(OBJD.de_simul AS DATE) END AS data_projetada,
+    EA.categoria AS status_projecao
+  FROM extrato_atual EA
+  LEFT JOIN objeto_dezena_atual OBJD ON OBJD.`of` = EA.`of`
+  WHERE EA.categoria NOT IN ('ROMANEIO', 'NF')
 ),
 
 resultado AS (
@@ -203,15 +102,15 @@ resultado AS (
     PNAT.qtde_saldo,
     COALESCE(CS.of_cobertura, CP.of_projecao) AS `of`,
     COALESCE(CS.data_cobertura, CP.data_projetada) AS data_cobertura,
-    COALESCE(CS.qtde_acumulada, CP.qtde_acumulada_final, SL.qtde_acumulada_leftover, 0) AS qtde_acumulada,
+    GREATEST(PNAT.qtde_saldo - COALESCE(EA.saldo_final_pn, PNAT.qtde_saldo), 0) AS qtde_acumulada,
     CASE
       WHEN CS.pn IS NOT NULL THEN 'COBERTO'
       WHEN CP.pn IS NOT NULL THEN CP.status_projecao
       ELSE 'DESCOBERTO'
     END AS status
   FROM pn_cobertura_atual PNAT
+  LEFT JOIN extrato_atual EA ON EA.pn = PNAT.pn
   LEFT JOIN cobertura_sd2 CS ON CS.pn = PNAT.pn
-  LEFT JOIN sd2_leftover SL ON SL.pn = PNAT.pn
   LEFT JOIN cobertura_projetada CP ON CP.pn = PNAT.pn
 )
 

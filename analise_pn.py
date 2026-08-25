@@ -15,9 +15,9 @@ from sqlalchemy import text
 from cobertura import (
     engine,
     monta_resultado_final,
-    passo2_emissao_sd2,
+    passo2_extrato_cobertura,
     passo3_data_cobertura,
-    passo4_projecao_faturamento,
+    passo4_projecao_de_simul,
 )
 
 
@@ -40,10 +40,10 @@ def analisar_pn(pn: str) -> pd.DataFrame:
         print(f"\npn '{pn}' nao encontrado em pn_cobertura_atual.")
         return df1
 
-    df2 = passo2_emissao_sd2([pn])
-    df3 = passo3_data_cobertura(df1, df2)
-    df4 = passo4_projecao_faturamento(df3, df2)
-    resultado = monta_resultado_final(df1, df3, df4)
+    df_extrato = passo2_extrato_cobertura([pn])
+    df3 = passo3_data_cobertura(df_extrato)
+    df4 = passo4_projecao_de_simul(df_extrato)
+    resultado = monta_resultado_final(df1, df_extrato, df3, df4)
     return resultado
 
 
